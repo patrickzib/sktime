@@ -14,7 +14,8 @@ from sklearn.feature_selection import chi2
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils import check_random_state
+from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import KFold
 
 from sktime.classification.base import BaseClassifier
 from sktime.transformers.series_as_features.dictionary_based import SFA
@@ -121,15 +122,15 @@ class WEASEL(BaseClassifier):
 
         self.anova = anova
 
-        self.norm_options = [False]
+        self.norm_options = [True, False]
         self.word_lengths = [4, 6]
 
         self.bigrams = bigrams
         self.binning_strategy = binning_strategy
         self.random_state = random_state
 
-        self.min_window = 4
-        self.max_window = 100
+        self.min_window = 8
+        self.max_window = 250
 
         self.window_inc = window_inc
         self.highest_bit = -1
@@ -168,88 +169,119 @@ class WEASEL(BaseClassifier):
         self.window_sizes = list(range(self.min_window, self.max_window, win_inc))
 
         self.highest_bit = (math.ceil(math.log2(self.max_window))) + 1
-        rng = check_random_state(self.random_state)
+        # rng = check_random_state(self.random_state)
 
-        all_words = [dict() for x in range(len(X))]
+        final_words = None
+        max_acc = -1
 
-        relevant_features_count = 0
+        for norm in self.norm_options:
+            for word_length in self.word_lengths:
 
-        for window_size in self.window_sizes:
+                all_words = [dict() for x in range(len(X))]
+                relevant_features_count = 0
+                transformers = []
 
-            transformer = SFA(
-                word_length=rng.choice(self.word_lengths),
-                alphabet_size=self.alphabet_size,
-                window_size=window_size,
-                norm=rng.choice(self.norm_options),
-                anova=self.anova,
-                # levels=rng.choice([1, 2, 3]),
-                binning_method=self.binning_strategy,
-                bigrams=self.bigrams,
-                remove_repeat_words=False,
-                lower_bounding=False,
-                save_words=False,
-            )
-
-            sfa_words = transformer.fit_transform(X, y)
-
-            self.SFA_transformers.append(transformer)
-            bag = sfa_words[0]
-
-            # chi-squared test to keep only relevant features
-            relevant_features = {}
-            apply_chi_squared = self.chi2_threshold > 0
-            if apply_chi_squared:
-                vectorizer = DictVectorizer(sparse=True)
-                bag_vec = vectorizer.fit_transform(bag)
-
-                if len(vectorizer.feature_names_) > 1000:
-                    chi2_statistics, p = chi2(bag_vec, y)
-                    relevant_features_idx = np.where(
-                        chi2_statistics >= self.chi2_threshold
-                    )[0]
-                    relevant_features = set(
-                        np.array(vectorizer.feature_names_)[relevant_features_idx]
+                for window_size in self.window_sizes:
+                    transformer = SFA(
+                        word_length=word_length,
+                        alphabet_size=self.alphabet_size,
+                        window_size=window_size,
+                        norm=norm,
+                        anova=self.anova,
+                        # levels=rng.choice([1, 2, 3]),
+                        binning_method=self.binning_strategy,
+                        bigrams=self.bigrams,
+                        remove_repeat_words=False,
+                        lower_bounding=False,
+                        save_words=False,
                     )
-                    relevant_features_count += len(relevant_features_idx)
-                else:
-                    relevant_features_count += len(vectorizer.feature_names_)
-                    apply_chi_squared = False
 
-            # merging bag-of-patterns of different window_sizes
-            # to single bag-of-patterns with prefix indicating
-            # the used window-length
-            for j in range(len(bag)):
-                for (key, value) in bag[j].items():
-                    # chi-squared test
-                    if (not apply_chi_squared) or (key in relevant_features):
-                        # append the prefixes to the words to
-                        # distinguish between window-sizes
-                        if isinstance(key, tuple):
-                            word = (
-                                ((key[0] << self.highest_bit) | key[1]) << 3
-                            ) | window_size
+                    sfa_words = transformer.fit_transform(X, y)
+                    transformers.append(transformer)
+                    bag = sfa_words[0]
+
+                    # chi-squared test to keep only relevant features
+                    relevant_features = {}
+                    apply_chi_squared = self.chi2_threshold > 0
+                    if apply_chi_squared:
+                        vectorizer = DictVectorizer(sparse=True)
+                        bag_vec = vectorizer.fit_transform(bag)
+
+                        if len(vectorizer.feature_names_) > 1000:
+                            chi2_statistics, p = chi2(bag_vec, y)
+                            relevant_features_idx = np.where(
+                                chi2_statistics >= self.chi2_threshold
+                            )[0]
+                            relevant_features = set(
+                                np.array(vectorizer.feature_names_)[
+                                    relevant_features_idx
+                                ]
+                            )
+                            relevant_features_count += len(relevant_features_idx)
                         else:
-                            # word = ((key << self.highest_bit) << 3) \
-                            #        | window_size
-                            word = WEASEL.shift_left(key, self.highest_bit, window_size)
+                            relevant_features_count += len(vectorizer.feature_names_)
+                            apply_chi_squared = False
 
-                        all_words[j][word] = value
+                    # merging bag-of-patterns of different window_sizes
+                    # to single bag-of-patterns with prefix indicating
+                    # the used window-length
+                    for j in range(len(bag)):
+                        for (key, value) in bag[j].items():
+                            # chi-squared test
+                            if (not apply_chi_squared) or (key in relevant_features):
+                                # append the prefixes to the words to
+                                # distinguish between window-sizes
+                                if isinstance(key, tuple):
+                                    word = (
+                                        ((key[0] << self.highest_bit) | key[1]) << 3
+                                    ) | window_size
+                                else:
+                                    # word = ((key << self.highest_bit) << 3) \
+                                    #        | window_size
+                                    word = WEASEL.shift_left(
+                                        key, self.highest_bit, window_size
+                                    )
 
-        self.clf = make_pipeline(
-            DictVectorizer(sparse=False),
-            StandardScaler(copy=False),
-            LogisticRegression(
-                max_iter=5000,
-                solver="liblinear",
-                dual=True,
-                # class_weight="balanced",
-                penalty="l2",
-                random_state=self.random_state,
-            ),
-        )
+                                all_words[j][word] = value
+
+                clf = make_pipeline(
+                    DictVectorizer(sparse=False),
+                    StandardScaler(copy=False),
+                    LogisticRegression(
+                        max_iter=5000,
+                        solver="liblinear",
+                        dual=True,
+                        tol=0.1,
+                        penalty="l2",
+                        random_state=self.random_state,
+                    ),
+                )
+
+                kfold = KFold(n_splits=5, random_state=self.random_state, shuffle=True)
+                current_acc = cross_val_score(clf, all_words, y, cv=kfold, n_jobs=-1).mean()
+
+                print(
+                    "Train acc:",
+                    norm,
+                    word_length,
+                    current_acc,
+                    "dict size",
+                    relevant_features_count,
+                )
+
+                if current_acc > max_acc:
+                    max_acc = current_acc
+                    self.clf = clf
+                    self.SFA_transformers = transformers
+                    final_words = all_words
+
+                if max_acc == 1.0:
+                    break  # there can be no better model than 1.0
+            if max_acc == 1.0:
+                break  # there can be no better model than 1.0
 
         # print("Size of dict", relevant_features_count)  # TODO uncomment
-        self.clf.fit(all_words, y)
+        self.clf.fit(final_words, y)
         self._is_fitted = True
         return self
 
