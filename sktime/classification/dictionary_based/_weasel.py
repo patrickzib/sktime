@@ -233,7 +233,7 @@ class WEASEL(BaseClassifier):
 
             return all_words, transformers, relevant_features_count
 
-        parallel_res = Parallel(backend="threading", n_jobs=self.n_jobs)(
+        parallel_res = Parallel(n_jobs=self.n_jobs)(
             delayed(_parallel_fit)(s)
             for s in self.gen_even_slices(
                 len(self.window_sizes), effective_n_jobs(self.n_jobs)
