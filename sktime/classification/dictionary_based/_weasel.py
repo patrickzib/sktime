@@ -225,7 +225,7 @@ class WEASEL(BaseClassifier):
 
                 return all_words, transformer, relevant_features_count
 
-        parallel_res = Parallel(n_jobs=self.n_jobs)(
+        parallel_res = Parallel(backend="threading", n_jobs=self.n_jobs)(
             delayed(_parallel_fit)(window_size) for window_size in self.window_sizes
         )  # , verbose=self.verbose
 
@@ -242,12 +242,11 @@ class WEASEL(BaseClassifier):
 
         self.clf = make_pipeline(
             DictVectorizer(sparse=True, sort=False),
-            # StandardScaler(copy=False),
             LogisticRegression(
                 max_iter=5000,
                 solver="liblinear",
                 dual=True,
-                # class_weight="balanced",
+                multi_class="ovr",
                 penalty="l2",
                 random_state=self.random_state,
             ),
