@@ -15,7 +15,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.utils import check_random_state
 
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, effective_n_jobs
 
 from sktime.classification.base import BaseClassifier
 from sktime.transformers.panel.dictionary_based import SFA
@@ -167,73 +167,84 @@ class WEASEL(BaseClassifier):
         win_inc = self.compute_window_inc()
 
         self.max_window = int(min(self.series_length, self.max_window))
+
+        rng = check_random_state(self.random_state)
         self.window_sizes = list(range(self.min_window, self.max_window, win_inc))
+        rng.shuffle(self.window_sizes)
 
         self.highest_bit = (math.ceil(math.log2(self.max_window))) + 1
 
         def _parallel_fit(
-            window_size,
+            slice,
         ):
-            rng = check_random_state(window_size)
+            transformers = []
             all_words = [dict() for x in range(len(X))]
             relevant_features_count = 0
 
-            # for window_size in self.window_sizes:
-            transformer = SFA(
-                word_length=rng.choice(self.word_lengths),
-                alphabet_size=self.alphabet_size,
-                window_size=window_size,
-                norm=rng.choice(self.norm_options),
-                anova=self.anova,
-                # levels=rng.choice([1, 2, 3]),
-                binning_method=self.binning_strategy,
-                bigrams=self.bigrams,
-                remove_repeat_words=False,
-                lower_bounding=False,
-                save_words=False,
-            )
+            for window_size in self.window_sizes[slice]:
+                rng = check_random_state(window_size)
 
-            sfa_words = transformer.fit_transform(X, y)
-
-            # self.SFA_transformers.append(transformer)
-            bag = sfa_words[0]
-            apply_chi_squared = self.p_threshold < 1
-
-            # chi-squared test to keep only relevant features
-            if apply_chi_squared:
-                vectorizer = DictVectorizer(sparse=True, dtype=np.int32, sort=False)
-                bag_vec = vectorizer.fit_transform(bag)
-
-                chi2_statistics, p = chi2(bag_vec, y)
-                relevant_features_idx = np.where(p <= self.p_threshold)[0]
-                relevant_features = set(
-                    np.array(vectorizer.feature_names_)[relevant_features_idx]
+                # for window_size in self.window_sizes:
+                transformer = SFA(
+                    word_length=rng.choice(self.word_lengths),
+                    alphabet_size=self.alphabet_size,
+                    window_size=window_size,
+                    norm=rng.choice(self.norm_options),
+                    anova=self.anova,
+                    # levels=rng.choice([1, 2, 3]),
+                    binning_method=self.binning_strategy,
+                    bigrams=self.bigrams,
+                    remove_repeat_words=False,
+                    lower_bounding=False,
+                    save_words=False,
                 )
-                relevant_features_count += len(relevant_features_idx)
 
-                # merging bag-of-patterns of different window_sizes
-                # to single bag-of-patterns with prefix indicating
-                # the used window-length
-                for j in range(len(bag)):
-                    for (key, value) in bag[j].items():
-                        # chi-squared test
-                        if (not apply_chi_squared) or (key in relevant_features):
-                            # append the prefixes to the words to
-                            # distinguish between window-sizes
-                            word = WEASEL.shift_left(key, self.highest_bit, window_size)
-                            all_words[j][word] = value
+                sfa_words = transformer.fit_transform(X, y)
+                transformers.append(transformer)
 
-                return all_words, transformer, relevant_features_count
+                bag = sfa_words[0]
+                apply_chi_squared = self.p_threshold < 1
+
+                # chi-squared test to keep only relevant features
+                if apply_chi_squared:
+                    vectorizer = DictVectorizer(sparse=True, dtype=np.int32, sort=False)
+                    bag_vec = vectorizer.fit_transform(bag)
+
+                    chi2_statistics, p = chi2(bag_vec, y)
+                    relevant_features_idx = np.where(p <= self.p_threshold)[0]
+                    relevant_features = set(
+                        np.array(vectorizer.feature_names_)[relevant_features_idx]
+                    )
+                    relevant_features_count += len(relevant_features_idx)
+
+                    # merging bag-of-patterns of different window_sizes
+                    # to single bag-of-patterns with prefix indicating
+                    # the used window-length
+                    for j in range(len(bag)):
+                        for (key, value) in bag[j].items():
+                            # chi-squared test
+                            if (not apply_chi_squared) or (key in relevant_features):
+                                # append the prefixes to the words to
+                                # distinguish between window-sizes
+                                word = WEASEL.shift_left(
+                                    key, self.highest_bit, window_size
+                                )
+                                all_words[j][word] = value
+
+            return all_words, transformers, relevant_features_count
 
         parallel_res = Parallel(backend="threading", n_jobs=self.n_jobs)(
-            delayed(_parallel_fit)(window_size) for window_size in self.window_sizes
+            delayed(_parallel_fit)(s)
+            for s in self.gen_even_slices(
+                len(self.window_sizes), effective_n_jobs(self.n_jobs)
+            )
         )  # , verbose=self.verbose
 
         relevant_features_count = 0
         all_words = [dict() for x in range(len(X))]
 
-        for sfa_words, transformer, rel_features_count in parallel_res:
-            self.SFA_transformers.append(transformer)
+        for sfa_words, transformers, rel_features_count in parallel_res:
+            self.SFA_transformers.extend(transformers)
             relevant_features_count += rel_features_count
 
             for idx, bag in enumerate(sfa_words):
@@ -256,6 +267,20 @@ class WEASEL(BaseClassifier):
         self.clf.fit(all_words, y)
         self._is_fitted = True
         return self
+
+    def gen_even_slices(self, n, n_packs):
+        start = 0
+        if n_packs < 1:
+            raise ValueError("gen_even_slices got n_packs=%s, must be >=1" % n_packs)
+
+        for pack_num in range(n_packs):
+            this_n = n // n_packs
+            if pack_num < n % n_packs:
+                this_n += 1
+            if this_n > 0:
+                end = start + this_n
+                yield slice(start, end, None)
+                start = end
 
     def predict(self, X):
         self.check_is_fitted()
